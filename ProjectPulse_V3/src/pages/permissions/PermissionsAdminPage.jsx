@@ -11,7 +11,7 @@ import { callPermissionFlow, callRoleFlow, callUserFlow } from "../../api/flows"
 import { COLORS, cardStyle, inputStyle } from "../../constants/theme";
 import { MODULES } from "../../constants/modules";
 import { usePermissions } from "../../context/PermissionContext";
-import { FLAGS, ZERO, hasAnyFlag, fetchModules, fetchRoleGrid, fetchUserOverrides, fetchUserRoleIds, mergeRoleGrids } from "../../utils/permissions";
+import { FLAGS, ZERO, hasAnyFlag, normalizeFlags, fetchModules, fetchRoleGrid, fetchUserOverrides, fetchUserRoleIds, mergeRoleGrids } from "../../utils/permissions";
 
 const COLUMNS = [
   { key: "canView", label: "View" },
@@ -39,6 +39,8 @@ export function PermissionsAdminPage() {
   const [grid, setGrid] = useState({});           // "<moduleId>" -> flags: own rows (role rows / user overrides)
   const [inherited, setInherited] = useState({}); // user tab: role-derived flags per module
   const [userRoleIds, setUserRoleIds] = useState([]);
+  const [roleReadFailed, setRoleReadFailed] = useState(false); // user tab: the role's grid couldn't be read
+  const [promptDismissed, setPromptDismissed] = useState(""); // user id whose "role not set" prompt was answered
   const [persisted, setPersisted] = useState([]); // ids that exist in SQL for this selection
   const [touched, setTouched] = useState([]);     // ids changed since load -> only these are saved
   const [cleared, setCleared] = useState([]);     // user tab: overrides to remove on save
@@ -80,21 +82,24 @@ export function PermissionsAdminPage() {
 
   const loadGrid = useCallback(async (id, forTab) => {
     const token = ++loadToken.current;
-    if (!id) { setGrid({}); setInherited({}); setUserRoleIds([]); setPersisted([]); setTouched([]); setCleared([]); return; }
+    if (!id) { setGrid({}); setInherited({}); setUserRoleIds([]); setRoleReadFailed(false); setPersisted([]); setTouched([]); setCleared([]); return; }
     setLoadingGrid(true);
     setError("");
     try {
-      let own = {}; let inh = {}; let rIds = [];
+      let own = {}; let inh = {}; let rIds = []; let roleFailed = false;
       if (forTab === "role") {
         own = await fetchRoleGrid(id);
       } else {
         const [ov, ids] = await Promise.all([fetchUserOverrides(id), fetchUserRoleIds(id)]);
         own = ov; rIds = ids;
-        inh = mergeRoleGrids(await Promise.all(ids.map(fetchRoleGrid)));
+        // A role that can't be read must not stop the admin from giving this user their own permissions.
+        inh = mergeRoleGrids(await Promise.all(ids.map((rid) => fetchRoleGrid(rid).catch(() => { roleFailed = true; return {}; }))));
       }
       if (token !== loadToken.current) return; // a newer selection won
-      setGrid(own); setInherited(inh); setUserRoleIds(rIds);
+      setGrid(own); setInherited(inh); setUserRoleIds(rIds); setRoleReadFailed(roleFailed);
+      if (roleFailed) setError("Couldn't read this user's role permissions, so only their own overrides are shown.");
       setPersisted(Object.keys(own)); setTouched([]); setCleared([]);
+      return own; // what SQL actually holds — save() compares it with what was just sent
     } catch (e) {
       if (token === loadToken.current) setError(e.message);
     } finally {
@@ -112,7 +117,7 @@ export function PermissionsAdminPage() {
 
   const switchTab = (t) => {
     if (t === tab || !confirmDiscard()) return;
-    setTab(t); setSelectedId(""); setGrid({}); setInherited({}); setUserRoleIds([]); setPersisted([]); setTouched([]); setCleared([]); setError("");
+    setTab(t); setSelectedId(""); setGrid({}); setInherited({}); setUserRoleIds([]); setRoleReadFailed(false); setPersisted([]); setTouched([]); setCleared([]); setError("");
   };
 
   // What a module row currently shows: its own row, else (user tab) the inherited role result.
@@ -211,14 +216,44 @@ export function PermissionsAdminPage() {
       setCleared((c) => c.filter((id) => failedIds.has(id)));
       setError(`Couldn't save ${failed.length} of ${jobs.length}: ${failed.map((f) => moduleName(f.job.id)).join(", ")}. Nothing else was lost — press Save again to retry.`);
     } else {
-      setToast("Permissions saved.");
-      loadGrid(selectedId, tab); // re-read from SQL so the grid shows exactly what was stored
+      // Read back from SQL and compare. A flow that answers "OK" without really writing the
+      // row must not look like success, so anything missing or different is reported by name.
+      const fresh = await loadGrid(selectedId, tab);
+      const wrongSave = fresh
+        ? saveIds.filter((id) => {
+            const row = fresh[id];
+            if (!row) return true;
+            const want = normalizeFlags(grid[id]);
+            return FLAGS.some((k) => !!row[k] !== !!want[k]);
+          })
+        : [];
+      const wrongClear = fresh ? cleared.filter((id) => !!fresh[id]) : [];
+      const bad = [...wrongSave, ...wrongClear];
+      if (bad.length) {
+        console.error("Permission save not persisted:", { action, selectedId, bad, sqlHas: fresh });
+        setError(`Sent ${action} for ${idField} ${selectedId}, and the flow answered OK, but reading it back returned ${Object.keys(fresh || {}).length} row(s) with nothing for: ${bad.map(moduleName).join(", ")}. In the flow's run history, compare ${idField} ${selectedId} with the Insert/Update inputs of that ${action} run.`);
+      } else {
+        setToast("Permissions saved.");
+      }
     }
     refreshMine();
   };
 
   const noSelection = !selectedId || loadingGrid;
   const roleNames = userRoleIds.map((id) => roles.find((r) => String(r.guid) === String(id))?.name).filter(Boolean);
+
+  // User tab: warn BEFORE the admin overrides anything when the user's role gives them nothing yet.
+  // User permissions always take priority; the role only fills in modules the user has no override for.
+  const userReady = tab === "user" && !!selectedId && !loadingGrid;
+  const noRole = userReady && userRoleIds.length === 0;
+  const roleNotSet = userReady && !roleReadFailed && userRoleIds.length > 0 && !Object.values(inherited).some(hasAnyFlag);
+  const showRolePrompt = (noRole || roleNotSet) && promptDismissed !== String(selectedId);
+
+  const goSetRole = () => {
+    if (!userRoleIds.length || !confirmDiscard()) return;
+    const rid = String(userRoleIds[0]);
+    setTab("role"); setSelectedId(rid); loadGrid(rid, "role");
+  };
 
   return (
     <div style={{ flex: 1, padding: 26, overflowY: "auto", position: "relative" }}>
@@ -261,8 +296,30 @@ export function PermissionsAdminPage() {
         <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12.5, color: COLORS.textMuted, marginBottom: 12 }}>
           <Info size={14} />
           {roleNames.length
-            ? <span>Role: <b style={{ color: COLORS.text }}>{roleNames.join(", ")}</b>. Greyed ticks are inherited from the role; changing a row here overrides the role for that module only.</span>
+            ? <span>Role: <b style={{ color: COLORS.text }}>{roleNames.join(", ")}</b>. Greyed ticks are inherited from the role; changing a row here overrides the role for that module only. Saved overrides: <b style={{ color: COLORS.text }}>{persisted.length}</b>.</span>
             : <span>This user has <b style={{ color: COLORS.text }}>no active role</b>, so they only get what you tick here. Assign a role under Admin → Employee Details.</span>}
+        </div>
+      )}
+
+      {showRolePrompt && (
+        <div role="alert" style={{ display: "flex", gap: 10, alignItems: "flex-start", flexWrap: "wrap", fontSize: 13, color: "#92400E", background: "#FEF3C7", border: "1px solid #FDE68A", borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
+          <Info size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div style={{ flex: 1, minWidth: 240, lineHeight: 1.5 }}>
+            <div style={{ fontWeight: 700, marginBottom: 2 }}>{noRole ? "This user has no role yet" : "Role permissions aren't set yet"}</div>
+            {noRole
+              ? <>Assign a role under <b>Admin → Employee Details</b>, or give this user direct permissions below. Direct permissions always take priority over a role.</>
+              : <>The role <b>{roleNames.join(", ") || "assigned to this user"}</b> has no access configured, so this user gets nothing from it. Set the role's permissions first, or give this user direct permissions below (they always take priority over the role).</>}
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {roleNotSet && (
+              <button type="button" onClick={goSetRole} style={{ background: COLORS.accent, color: "#fff", border: "none", borderRadius: 8, padding: "8px 13px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+                Set role permissions
+              </button>
+            )}
+            <button type="button" onClick={() => setPromptDismissed(String(selectedId))} style={{ background: "#fff", color: COLORS.text, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "8px 13px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+              Give direct permissions
+            </button>
+          </div>
         </div>
       )}
 
