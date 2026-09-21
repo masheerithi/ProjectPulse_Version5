@@ -33,15 +33,16 @@ const statusOrderIndex = (name) => STATUS_ORDER.indexOf((name || "").trim().toLo
 
 export function ProjectDashboardPage() {
   const lookups = useLookups();
-  const { projects, loading, error: loadError, refresh, allResources } = useProjectsWithResources();
+  const { projects, setProjects, loading, error: loadError, refresh, allResources } = useProjectsWithResources();
   const [search, setSearch] = useState("");
-  const [view, setView] = useState("cards"); // 'cards' | 'table'
+  const [view, setView] = useState("table"); // 'table' (default) | 'cards'
   const [panel, setPanel] = useState(null); // { mode: 'add'|'edit', data, originalResourceGuids }
   const [detail, setDetail] = useState(null); // selected project for drawer
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
   const [toast, setToast] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [togglingGuid, setTogglingGuid] = useState(null); // project whose Active switch is saving
 
   const filtered = loadError ? [] : projects.filter((p) =>
     p.projectName.toLowerCase().includes(search.toLowerCase()) || p.projectCode.toLowerCase().includes(search.toLowerCase())
@@ -116,6 +117,24 @@ export function ProjectDashboardPage() {
       data: JSON.parse(JSON.stringify(p)),
       originalResourceGuids: p.resources.map((r) => r.guid).filter((g) => g !== "" && g !== undefined),
     });
+  };
+
+  // Same one-click Active/Inactive switch as the master screens. Re-sends the
+  // project as-is with only `active` flipped, then patches just that row in
+  // local state from the flow's response (no full re-LIST, so no flicker).
+  const toggleActive = (p) => {
+    if (togglingGuid) return;
+    setTogglingGuid(p.guid);
+    callProjectFlow("EDIT", { ...p, active: !p.active })
+      .then((res) => {
+        const row = (res.data || []).find((x) => String(x.guid) === String(p.guid));
+        const next = row ? !!row.active : !p.active;
+        setProjects((prev) => prev.map((x) => (String(x.guid) === String(p.guid) ? { ...x, active: next } : x)));
+        logAudit("Project", "Update", p.projectName || p.projectCode || "record");
+        setToast(`Marked ${next ? "Active" : "Inactive"}.`);
+      })
+      .catch((e) => setToast(`Update failed: ${e.message}`))
+      .finally(() => setTogglingGuid(null));
   };
 
   const requestDelete = (p) => {
@@ -340,11 +359,11 @@ export function ProjectDashboardPage() {
             <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by project code or name" style={{ border: "none", outline: "none", fontSize: 13, width: "100%", fontFamily: "Inter, sans-serif" }} />
           </div>
           <div style={{ display: "flex", border: `1px solid ${COLORS.border}`, borderRadius: 8, overflow: "hidden" }}>
-            <button onClick={() => setView("cards")} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", border: "none", background: view === "cards" ? COLORS.accent : "#fff", color: view === "cards" ? "#fff" : COLORS.text, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
-              <LayoutGrid size={13} /> Cards
-            </button>
             <button onClick={() => setView("table")} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", border: "none", background: view === "table" ? COLORS.accent : "#fff", color: view === "table" ? "#fff" : COLORS.text, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
               <List size={13} /> Table
+            </button>
+            <button onClick={() => setView("cards")} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", border: "none", background: view === "cards" ? COLORS.accent : "#fff", color: view === "cards" ? "#fff" : COLORS.text, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+              <LayoutGrid size={13} /> Cards
             </button>
           </div>
         </div>
@@ -355,7 +374,7 @@ export function ProjectDashboardPage() {
               <thead>
                 <tr style={{ background: COLORS.bg }}>
                   {["Project Code", "Project Name", "Category", "Client", "Billing Type", "Duration", "Resources", "Status", "Actions"].map((h) => (
-                    <th key={h} style={{ textAlign: h === "Actions" ? "center" : "left", padding: "10px 16px", fontSize: 12, color: COLORS.textMuted, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3 }}>{h}</th>
+                    <th key={h} style={{ textAlign: h === "Actions" ? "center" : "left", padding: "10px 10px", fontSize: 12, color: COLORS.textMuted, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.3 }}>{h}</th>
                   ))}
                 </tr>
               </thead>
@@ -370,16 +389,19 @@ export function ProjectDashboardPage() {
                   <tr><td colSpan={9} style={{ padding: 40, textAlign: "center", color: COLORS.textMuted }}>No data available.</td></tr>
                 ) : filtered.map((p, i) => (
                   <tr key={p.id} style={{ borderTop: `1px solid ${COLORS.border}`, background: i % 2 ? "#FAFBFD" : "#fff", cursor: "pointer" }} onClick={() => setDetail(p)}>
-                    <td style={{ padding: "11px 16px", fontSize: 13.5, color: COLORS.text, fontWeight: 600 }}>{p.projectCode}</td>
-                    <td style={{ padding: "11px 16px", fontSize: 13.5, color: COLORS.text }}>{p.projectName}</td>
-                    <td style={{ padding: "11px 16px", fontSize: 13, color: COLORS.text }}>{findName(lookups.categories, p.categoryId)}</td>
-                    <td style={{ padding: "11px 16px", fontSize: 13, color: COLORS.text }}>{findName(lookups.clients, p.clientId)}</td>
-                    <td style={{ padding: "11px 16px", fontSize: 13, color: COLORS.text }}>{findName(lookups.billingTypes, p.billingTypeId)}</td>
-                    <td style={{ padding: "11px 16px", fontSize: 12, color: COLORS.textMuted }}>{fmtDate(p.startDate)} → {fmtDate(p.endDate)}</td>
-                    <td style={{ padding: "11px 16px", fontSize: 13, color: COLORS.text }}>{p.resources.length}</td>
-                    <td style={{ padding: "11px 16px" }}>
+                    <td style={{ padding: "11px 10px", fontSize: 13.5, color: COLORS.text, fontWeight: 600 }}>{p.projectCode}</td>
+                    <td style={{ padding: "11px 10px", fontSize: 13.5, color: COLORS.text }}>{p.projectName}</td>
+                    <td style={{ padding: "11px 10px", fontSize: 13, color: COLORS.text }}>{findName(lookups.categories, p.categoryId)}</td>
+                    <td style={{ padding: "11px 10px", fontSize: 13, color: COLORS.text }}>{findName(lookups.clients, p.clientId)}</td>
+                    <td style={{ padding: "11px 10px", fontSize: 13, color: COLORS.text }}>{findName(lookups.billingTypes, p.billingTypeId)}</td>
+                    <td style={{ padding: "11px 10px", fontSize: 12, color: COLORS.textMuted, whiteSpace: "nowrap", lineHeight: 1.45 }}>
+                      <div>{fmtDate(p.startDate)}</div>
+                      <div>→ {fmtDate(p.endDate)}</div>
+                    </td>
+                    <td style={{ padding: "11px 10px", fontSize: 13, color: COLORS.text }}>{p.resources.length}</td>
+                    <td style={{ padding: "11px 10px" }} onClick={(e) => e.stopPropagation()}>
                       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                        <StatusBadge active={p.active} />
+                        <StatusBadge active={p.active} busy={String(togglingGuid) === String(p.guid)} onToggle={() => toggleActive(p)} />
                         {p.projectStatusId && (
                           <span style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.accent, background: COLORS.accentSoft, padding: "2px 8px", borderRadius: 999, width: "fit-content" }}>
                             {findName(lookups.projectStatuses, p.projectStatusId)}
@@ -395,18 +417,19 @@ export function ProjectDashboardPage() {
                         })()}
                       </div>
                     </td>
-                    <td style={{ padding: "11px 16px", textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                    <td style={{ padding: "11px 10px", textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
                       <div style={{ display: "inline-flex", gap: 8 }}>
-                        <button onClick={() => openEdit(p)} style={{ display: "inline-flex", alignItems: "center", gap: 6, background: COLORS.accentSoft, color: COLORS.accent, border: "none", borderRadius: 7, padding: "6px 11px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
-                          <Pencil size={12} /> Edit
+                        <button onClick={() => openEdit(p)} title="Edit" aria-label="Edit project" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", background: COLORS.accentSoft, color: COLORS.accent, border: "none", borderRadius: 7, padding: "7px 9px", cursor: "pointer" }}>
+                          <Pencil size={13} />
                         </button>
                         <button
                           onClick={() => requestDelete(p)}
                           disabled={!isDeletable(p)}
-                          title={!isDeletable(p) ? undeletableReason(p) : undefined}
-                          style={{ display: "inline-flex", alignItems: "center", gap: 6, background: COLORS.dangerSoft, color: COLORS.danger, border: "none", borderRadius: 7, padding: "6px 11px", fontSize: 12.5, fontWeight: 600, cursor: isDeletable(p) ? "pointer" : "not-allowed", opacity: isDeletable(p) ? 1 : 0.5 }}
+                          title={isDeletable(p) ? "Delete" : undeletableReason(p)}
+                          aria-label="Delete project"
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", background: COLORS.dangerSoft, color: COLORS.danger, border: "none", borderRadius: 7, padding: "7px 9px", cursor: isDeletable(p) ? "pointer" : "not-allowed", opacity: isDeletable(p) ? 1 : 0.5 }}
                         >
-                          <Trash2 size={12} /> Delete
+                          <Trash2 size={13} />
                         </button>
                       </div>
                     </td>
@@ -432,8 +455,8 @@ export function ProjectDashboardPage() {
                   <div style={{ fontWeight: 700, fontSize: 14.5, color: COLORS.text }}>{p.projectName}</div>
                   <div style={{ fontSize: 12, color: COLORS.textMuted }}>{p.projectCode}</div>
                 </div>
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                  <StatusBadge active={p.active} />
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }} onClick={(e) => e.stopPropagation()}>
+                  <StatusBadge active={p.active} busy={String(togglingGuid) === String(p.guid)} onToggle={() => toggleActive(p)} />
                   {p.projectStatusId && (
                     <span style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.accent, background: COLORS.accentSoft, padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap" }}>
                       {findName(lookups.projectStatuses, p.projectStatusId)}
