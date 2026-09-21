@@ -1288,6 +1288,7 @@ export function callAuthFlow(action, payload = {}) {
     action,
     userId: payload.userId ? Number(payload.userId) : null,
     username: payload.username || "",
+    email: payload.email || "", 
     passwordHashB64: payload.passwordHashB64 || "",
     token: payload.token || "",
     expiresOn: payload.expiresOn || "",
